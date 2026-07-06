@@ -16,7 +16,7 @@
 const { useState, useEffect, useRef, useMemo, useCallback } = React;
 const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line, Cell } = Recharts;
 
-/* Persistance locale (navigateur) — remplace le stockage d'artifact Claude */
+/* Persistance locale (navigateur) */
 const appStorage = {
   get: async (k) => { const v = localStorage.getItem(k); return v == null ? null : { value: v }; },
   set: async (k, v) => localStorage.setItem(k, v),
@@ -137,25 +137,48 @@ function postER(p) {
 }
 
 /* ---------- extraction de frames ---------- */
-function extractFrames(url, nFrames = 4) {
+const FRAME_INTERVAL_S = 2;  // une frame toutes les 2 secondes
+const MAX_FRAMES = 20;       // plafond d'extraction : au-delà, répartition uniforme sur la durée
+const MAX_FRAMES_API = 12;   // plafond envoyé à l'IA (économie de tokens), réparti uniformément
+const FRAME_WIDTH = 256;     // largeur des frames (les tokens API dépendent des pixels)
+const FRAME_JPEG_Q = 0.55;   // compression JPEG (poids/rapidité d'envoi)
+
+function sampleFrames(frames, n) {
+  if (frames.length <= n) return frames;
+  const step = (frames.length - 1) / (n - 1);
+  return Array.from({ length: n }, (_, k) => frames[Math.round(k * step)]);
+}
+
+function extractFrames(url) {
   return new Promise((resolve, reject) => {
     const v = document.createElement("video");
     v.crossOrigin = "anonymous"; v.preload = "auto"; v.muted = true; v.playsInline = true;
-    const frames = []; const pts = [0.08, 0.35, 0.62, 0.88].slice(0, nFrames);
+    const frames = []; let pts = [];
     let i = 0; let done = false;
     const finish = (ok, err) => { if (done) return; done = true; v.src = ""; ok ? resolve(frames) : reject(err); };
-    const timer = setTimeout(() => finish(frames.length > 0, new Error("Délai dépassé")), 45000);
-    v.onloadedmetadata = () => { try { v.currentTime = Math.max(0.1, pts[0] * v.duration); } catch (e) { clearTimeout(timer); finish(false, e); } };
+    const timer = setTimeout(() => finish(frames.length > 0, new Error("Délai dépassé")), 120000);
+    v.onloadedmetadata = () => {
+      try {
+        const d = v.duration || 10;
+        for (let t = 0.5; t < d - 0.2; t += FRAME_INTERVAL_S) pts.push(t);
+        if (!pts.length) pts = [Math.max(0.1, d / 2)];
+        if (pts.length > MAX_FRAMES) {
+          const step = (pts.length - 1) / (MAX_FRAMES - 1);
+          pts = Array.from({ length: MAX_FRAMES }, (_, k) => pts[Math.round(k * step)]);
+        }
+        v.currentTime = pts[0];
+      } catch (e) { clearTimeout(timer); finish(false, e); }
+    };
     v.onseeked = () => {
       try {
         const c = document.createElement("canvas");
-        const w = 320;
-        c.width = w; c.height = Math.max(1, Math.round((w * v.videoHeight) / v.videoWidth) || 568);
+        const w = FRAME_WIDTH;
+        c.width = w; c.height = Math.max(1, Math.round((w * v.videoHeight) / v.videoWidth) || 455);
         c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-        frames.push(c.toDataURL("image/jpeg", 0.72));
+        frames.push(c.toDataURL("image/jpeg", FRAME_JPEG_Q));
       } catch (e) { clearTimeout(timer); return finish(false, e); }
       i++;
-      if (i < pts.length) { v.currentTime = pts[i] * v.duration; }
+      if (i < pts.length) { v.currentTime = pts[i]; }
       else { clearTimeout(timer); finish(true); }
     };
     v.onerror = () => { clearTimeout(timer); finish(false, new Error("Chargement vidéo impossible")); };
@@ -163,18 +186,18 @@ function extractFrames(url, nFrames = 4) {
   });
 }
 
-function extractFramesFromFile(file, nFrames = 4) {
+function extractFramesFromFile(file) {
   const url = URL.createObjectURL(file);
-  return extractFrames(url, nFrames).finally(() => URL.revokeObjectURL(url));
+  return extractFrames(url).finally(() => URL.revokeObjectURL(url));
 }
 
 /* ---------- appels Claude ---------- */
-async function askClaude(content, maxTokens = 1000) {
+async function askClaude(content, maxTokens = 1000, model = "claude-sonnet-4-6") {
   if (!ANTHROPIC_KEY) throw new Error("Ajoute ta clé API Anthropic (bouton dans la barre latérale).");
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
-    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content }] }),
+    body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
   });
   if (!res.ok) throw new Error("Erreur API (" + res.status + ")");
   const data = await res.json();
@@ -189,40 +212,39 @@ function parseJsonReply(txt) {
 
 async function tagPost(post) {
   const content = [];
-  const frames = post.frames || [];
-  for (const f of frames.slice(0, 4)) {
+  const frames = sampleFrames(post.frames || [], MAX_FRAMES_API);
+  for (const f of frames) {
     content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: f.split(",")[1] } });
   }
   if (!frames.length && post.imageUrls?.length) {
-    for (const u of post.imageUrls.slice(0, 4)) content.push({ type: "image", source: { type: "url", url: u } });
+    for (const u of post.imageUrls.slice(0, MAX_FRAMES_API)) content.push({ type: "image", source: { type: "url", url: u } });
   }
   content.push({
     type: "text",
-    text: `Tu analyses un post ${post.platform === "tiktok" ? "TikTok" : "Instagram"} publié par la marque @${post.account}.
-Caption : """${truncate(post.caption, 600)}"""
-${post.transcript ? `Transcription audio : """${truncate(post.transcript, 900)}"""` : "Pas de transcription disponible."}
-${content.length > 1 ? "Les images ci-dessus sont des frames extraites de la vidéo (ou les images du diaporama)." : "Aucune image disponible : base-toi sur le texte."}
-
-Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, avec exactement ces clés :
+    text: `Post ${post.platform === "tiktok" ? "TikTok" : "Instagram"} de @${post.account}.
+Caption : """${truncate(post.caption, 400)}"""
+${post.transcript ? `Transcription : """${truncate(post.transcript, 600)}"""` : ""}
+${content.length > 1 ? "Frames chronologiques (~1/2s) : les premières = hook, les dernières = chute." : "Pas d'image : base-toi sur le texte."}
+Réponds UNIQUEMENT en JSON valide, sans texte autour :
 {
  "format": un parmi ["face-cam","ugc","tutoriel","trend-meme","produit","coulisses","micro-trottoir","animation-motion","diaporama","interview","sketch","autre"],
- "hookType": type d'accroche des 2 premières secondes (ex: "question", "affirmation choc", "visuel intriguant", "texte à l'écran", "situation"),
- "hookDescription": description du hook en une phrase courte,
- "decor": lieu/décor principal en 2-4 mots,
+ "hookType": type d'accroche des 2 premières secondes,
+ "hookDescription": le hook en une phrase courte,
+ "decor": 2-4 mots,
  "presenceHumaine": true/false,
  "texteALecran": true/false,
- "esthetique": style visuel en 3-6 mots,
- "sujets": tableau de 1 à 3 thèmes courts
+ "esthetique": 3-6 mots,
+ "sujets": 1 à 3 thèmes courts
 }`,
   });
-  const reply = await askClaude(content, 700);
+  const reply = await askClaude(content, 500, "claude-haiku-4-5");
   return parseJsonReply(reply);
 }
 
 async function analyzeBrand(comp, posts) {
-  const sample = [...posts].sort((a, b) => (b.plays || 0) - (a.plays || 0)).slice(0, 28);
+  const sample = [...posts].sort((a, b) => (b.plays || 0) - (a.plays || 0)).slice(0, 20);
   const corpus = sample.map((p, i) =>
-    `#${i + 1} [${(p.date || "").slice(0, 10)} · ${cnum(p.plays)} vues] Caption: ${truncate(p.caption, 260)}${p.transcript ? " | Transcription: " + truncate(p.transcript, 320) : ""}`
+    `#${i + 1} [${(p.date || "").slice(0, 10)} · ${cnum(p.plays)} vues] Caption: ${truncate(p.caption, 200)}${p.transcript ? " | Transcription: " + truncate(p.transcript, 240) : ""}`
   ).join("\n");
   const text = `Tu es analyste en stratégie éditoriale social media. Voici ${sample.length} posts publics de la marque @${comp.handle} (${comp.nickName}) sur ${comp.platform === "tiktok" ? "TikTok" : "Instagram"}.
 Bio : "${comp.signature || "—"}"
@@ -239,7 +261,7 @@ Analyse la personnalité de marque et la tonalité éditoriale. Réponds UNIQUEM
  "faiblesses": tableau de 2-4 faiblesses ou angles morts,
  "resume": synthèse stratégique en 2-3 phrases (positionnement perçu, à qui la marque parle)
 }`;
-  const reply = await askClaude([{ type: "text", text }], 1400);
+  const reply = await askClaude([{ type: "text", text }], 1200);
   return parseJsonReply(reply);
 }
 
@@ -816,7 +838,7 @@ function SocialDecoder() {
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
                     <div>
                       <div style={S.cardTitle}>Images extraites des vidéos</div>
-                      <div style={S.cardSub}>4 frames par vidéo, extraites dans ton navigateur depuis les MP4 hébergés par Apify. <span className="mono">{stats.framed}/{stats.posts}</span> posts couverts (diaporamas inclus).</div>
+                      <div style={S.cardSub}>Une frame toutes les 2 secondes (jusqu'à 20 extraites, 12 envoyées à l'IA), en basse résolution pour économiser les tokens. <span className="mono">{stats.framed}/{stats.posts}</span> posts couverts (diaporamas inclus).</div>
                     </div>
                     <div style={{ display: "flex", gap: 8 }}>
                       <button style={S.secondaryBtn} disabled={!!busy} onClick={() => runFrames(10)}>Extraire 10 vidéos</button>
@@ -997,7 +1019,7 @@ function SocialDecoder() {
                     </div>
                     <button style={S.primaryBtn} disabled={!!busy} onClick={() => runBrand(key)}>{b ? "Réanalyser" : "Analyser la personnalité de marque"}</button>
                   </div>
-                  {!b && <div style={{ ...S.cardSub, marginTop: 8 }}>L'analyse s'appuie sur les captions et transcriptions des {Math.min(c.posts.length, 28)} posts les plus vus. Récupère les transcriptions à l'étape 2 pour un portrait plus fin.</div>}
+                  {!b && <div style={{ ...S.cardSub, marginTop: 8 }}>L'analyse s'appuie sur les captions et transcriptions des {Math.min(c.posts.length, 20)} posts les plus vus. Récupère les transcriptions à l'étape 2 pour un portrait plus fin.</div>}
                   {b && (
                     <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
                       <div>
