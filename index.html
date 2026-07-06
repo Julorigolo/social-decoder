@@ -1,0 +1,1133 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Social Decoder — Benchmark concurrentiel</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body style="margin:0">
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line, Cell } = Recharts;
+
+/* Persistance locale (navigateur) — remplace le stockage d'artifact Claude */
+const appStorage = {
+  get: async (k) => { const v = localStorage.getItem(k); return v == null ? null : { value: v }; },
+  set: async (k, v) => localStorage.setItem(k, v),
+  delete: async (k) => localStorage.removeItem(k),
+};
+
+/* Clé API Anthropic pour les analyses IA (stockée dans ce navigateur uniquement) */
+let ANTHROPIC_KEY = localStorage.getItem("sd_anthropic_key") || "";
+
+/* ============================================================
+   SOCIAL DECODER — Benchmark concurrentiel TikTok / Instagram
+   Pipeline : Importer → Enrichir → Comparer → Décoder
+   ============================================================ */
+
+const RAMP = ["#FE2C55", "#0FB5BA", "#C13584", "#E8A33D", "#5B67D8", "#1E8A5A", "#8A4FBE", "#C7501E"];
+const FMT_LABELS = {
+  "face-cam": "Face cam", "ugc": "UGC", "tutoriel": "Tutoriel", "trend-meme": "Trend / mème",
+  "produit": "Produit", "coulisses": "Coulisses", "micro-trottoir": "Micro-trottoir",
+  "animation-motion": "Animation", "diaporama": "Diaporama", "interview": "Interview",
+  "sketch": "Sketch", "autre": "Autre",
+};
+
+/* ---------- helpers ---------- */
+const nf = new Intl.NumberFormat("fr-FR", { notation: "compact", maximumFractionDigits: 1 });
+const cnum = (n) => (n == null || isNaN(n) ? "—" : nf.format(n));
+const pct = (n) => (n == null || isNaN(n) ? "—" : (n * 100).toFixed(2).replace(".", ",") + " %");
+const median = (arr) => {
+  const a = arr.filter((x) => x != null && !isNaN(x)).sort((x, y) => x - y);
+  if (!a.length) return null;
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+};
+const truncate = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s || "");
+const monthKey = (iso) => (iso || "").slice(0, 7);
+
+function parseVtt(txt) {
+  const lines = txt.split(/\r?\n/);
+  const out = [];
+  for (const l of lines) {
+    const t = l.trim();
+    if (!t || /^WEBVTT/i.test(t) || /-->/.test(t) || /^\d+$/.test(t) || /^NOTE/i.test(t)) continue;
+    const clean = t.replace(/<[^>]+>/g, "");
+    if (clean && out[out.length - 1] !== clean) out.push(clean);
+  }
+  return out.join(" ");
+}
+
+/* ---------- normalisation Apify ---------- */
+function detectPlatform(item) {
+  if (item.authorMeta || item.webVideoUrl) return "tiktok";
+  if (item.ownerUsername || (item.inputUrl || "").includes("instagram") || item.shortCode) return "instagram";
+  return null;
+}
+
+function pickSubtitle(links) {
+  if (!Array.isArray(links) || !links.length) return null;
+  const fr = links.find((l) => /^fr/i.test(l.language || ""));
+  return (fr || links[0]).downloadLink || null;
+}
+
+function normalizeItem(item) {
+  const platform = detectPlatform(item);
+  if (!platform) return null;
+  if (platform === "tiktok") {
+    const isSlideshow = !!item.isSlideshow;
+    const media = Array.isArray(item.mediaUrls) ? item.mediaUrls : [];
+    return {
+      id: `tt_${item.id}`, platform,
+      account: item.authorMeta?.name || "inconnu",
+      nickName: item.authorMeta?.nickName || item.authorMeta?.name,
+      authorMeta: {
+        fans: item.authorMeta?.fans, heart: item.authorMeta?.heart,
+        video: item.authorMeta?.video, signature: item.authorMeta?.signature,
+        verified: item.authorMeta?.verified,
+      },
+      date: item.createTimeISO, caption: item.text || "",
+      hashtags: (item.hashtags || []).map((h) => h.name).filter(Boolean),
+      duration: item.videoMeta?.duration || null,
+      isAd: !!(item.isAd || item.isSponsored), isSlideshow,
+      plays: item.playCount, likes: item.diggCount, comments: item.commentCount,
+      shares: item.shareCount, saves: item.collectCount, reposts: item.repostCount,
+      videoUrl: !isSlideshow ? (media[0] || item.videoMeta?.downloadAddr || null) : null,
+      imageUrls: isSlideshow ? media : [],
+      coverUrl: item.videoMeta?.coverUrl || null,
+      subtitleUrl: pickSubtitle(item.videoMeta?.subtitleLinks),
+      webUrl: item.webVideoUrl,
+      files: item._files || null, folder: item._folder || null,
+      transcript: null, frames: [], tags: null, frameError: null,
+    };
+  }
+  // Instagram
+  const isVideo = item.type === "Video";
+  return {
+    id: `ig_${item.id || item.shortCode}`, platform,
+    account: item.ownerUsername || "inconnu",
+    nickName: item.ownerFullName || item.ownerUsername,
+    authorMeta: { fans: item.followersCount || null },
+    date: item.timestamp, caption: item.caption || "",
+    hashtags: item.hashtags || [],
+    duration: item.videoDuration || null,
+    isAd: !!item.isSponsored, isSlideshow: item.type === "Sidecar",
+    plays: item.videoPlayCount || item.videoViewCount || null,
+    likes: item.likesCount, comments: item.commentsCount,
+    shares: null, saves: null, reposts: null,
+    videoUrl: isVideo ? item.videoUrl || null : null,
+    imageUrls: item.type === "Sidecar" ? (item.images || []).map((i) => (typeof i === "string" ? i : i.url)) : item.type === "Image" ? [item.displayUrl] : [],
+    coverUrl: item.displayUrl || null,
+    subtitleUrl: null, webUrl: item.url,
+    files: item._files || null, folder: item._folder || null,
+    transcript: null, frames: [], tags: null, frameError: null,
+  };
+}
+
+function postER(p) {
+  const eng = (p.likes || 0) + (p.comments || 0) + (p.shares || 0) + (p.saves || 0);
+  if (p.plays > 0) return eng / p.plays;
+  return null;
+}
+
+/* ---------- extraction de frames ---------- */
+function extractFrames(url, nFrames = 4) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    v.crossOrigin = "anonymous"; v.preload = "auto"; v.muted = true; v.playsInline = true;
+    const frames = []; const pts = [0.08, 0.35, 0.62, 0.88].slice(0, nFrames);
+    let i = 0; let done = false;
+    const finish = (ok, err) => { if (done) return; done = true; v.src = ""; ok ? resolve(frames) : reject(err); };
+    const timer = setTimeout(() => finish(frames.length > 0, new Error("Délai dépassé")), 45000);
+    v.onloadedmetadata = () => { try { v.currentTime = Math.max(0.1, pts[0] * v.duration); } catch (e) { clearTimeout(timer); finish(false, e); } };
+    v.onseeked = () => {
+      try {
+        const c = document.createElement("canvas");
+        const w = 320;
+        c.width = w; c.height = Math.max(1, Math.round((w * v.videoHeight) / v.videoWidth) || 568);
+        c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+        frames.push(c.toDataURL("image/jpeg", 0.72));
+      } catch (e) { clearTimeout(timer); return finish(false, e); }
+      i++;
+      if (i < pts.length) { v.currentTime = pts[i] * v.duration; }
+      else { clearTimeout(timer); finish(true); }
+    };
+    v.onerror = () => { clearTimeout(timer); finish(false, new Error("Chargement vidéo impossible")); };
+    v.src = url;
+  });
+}
+
+function extractFramesFromFile(file, nFrames = 4) {
+  const url = URL.createObjectURL(file);
+  return extractFrames(url, nFrames).finally(() => URL.revokeObjectURL(url));
+}
+
+/* ---------- appels Claude ---------- */
+async function askClaude(content, maxTokens = 1000) {
+  if (!ANTHROPIC_KEY) throw new Error("Ajoute ta clé API Anthropic (bouton dans la barre latérale).");
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content }] }),
+  });
+  if (!res.ok) throw new Error("Erreur API (" + res.status + ")");
+  const data = await res.json();
+  return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+function parseJsonReply(txt) {
+  const clean = txt.replace(/```json|```/g, "").trim();
+  const start = clean.indexOf("{"); const end = clean.lastIndexOf("}");
+  return JSON.parse(clean.slice(start, end + 1));
+}
+
+async function tagPost(post) {
+  const content = [];
+  const frames = post.frames || [];
+  for (const f of frames.slice(0, 4)) {
+    content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: f.split(",")[1] } });
+  }
+  if (!frames.length && post.imageUrls?.length) {
+    for (const u of post.imageUrls.slice(0, 4)) content.push({ type: "image", source: { type: "url", url: u } });
+  }
+  content.push({
+    type: "text",
+    text: `Tu analyses un post ${post.platform === "tiktok" ? "TikTok" : "Instagram"} publié par la marque @${post.account}.
+Caption : """${truncate(post.caption, 600)}"""
+${post.transcript ? `Transcription audio : """${truncate(post.transcript, 900)}"""` : "Pas de transcription disponible."}
+${content.length > 1 ? "Les images ci-dessus sont des frames extraites de la vidéo (ou les images du diaporama)." : "Aucune image disponible : base-toi sur le texte."}
+
+Réponds UNIQUEMENT avec un objet JSON valide, sans texte autour, avec exactement ces clés :
+{
+ "format": un parmi ["face-cam","ugc","tutoriel","trend-meme","produit","coulisses","micro-trottoir","animation-motion","diaporama","interview","sketch","autre"],
+ "hookType": type d'accroche des 2 premières secondes (ex: "question", "affirmation choc", "visuel intriguant", "texte à l'écran", "situation"),
+ "hookDescription": description du hook en une phrase courte,
+ "decor": lieu/décor principal en 2-4 mots,
+ "presenceHumaine": true/false,
+ "texteALecran": true/false,
+ "esthetique": style visuel en 3-6 mots,
+ "sujets": tableau de 1 à 3 thèmes courts
+}`,
+  });
+  const reply = await askClaude(content, 700);
+  return parseJsonReply(reply);
+}
+
+async function analyzeBrand(comp, posts) {
+  const sample = [...posts].sort((a, b) => (b.plays || 0) - (a.plays || 0)).slice(0, 28);
+  const corpus = sample.map((p, i) =>
+    `#${i + 1} [${(p.date || "").slice(0, 10)} · ${cnum(p.plays)} vues] Caption: ${truncate(p.caption, 260)}${p.transcript ? " | Transcription: " + truncate(p.transcript, 320) : ""}`
+  ).join("\n");
+  const text = `Tu es analyste en stratégie éditoriale social media. Voici ${sample.length} posts publics de la marque @${comp.handle} (${comp.nickName}) sur ${comp.platform === "tiktok" ? "TikTok" : "Instagram"}.
+Bio : "${comp.signature || "—"}"
+
+${corpus}
+
+Analyse la personnalité de marque et la tonalité éditoriale. Réponds UNIQUEMENT avec un objet JSON valide :
+{
+ "personnalite": portrait de la personnalité de marque en 1-2 phrases,
+ "tonalites": tableau de 3-5 adjectifs de ton,
+ "registre": registre de langue et style d'écriture en une phrase,
+ "piliersEditoriaux": tableau de 3-5 piliers de contenu identifiés,
+ "forces": tableau de 2-4 forces éditoriales,
+ "faiblesses": tableau de 2-4 faiblesses ou angles morts,
+ "resume": synthèse stratégique en 2-3 phrases (positionnement perçu, à qui la marque parle)
+}`;
+  const reply = await askClaude([{ type: "text", text }], 1400);
+  return parseJsonReply(reply);
+}
+
+async function analyzePatterns(rows, handle) {
+  const table = rows.map((r) =>
+    `${FMT_LABELS[r.format] || r.format} : ${r.count} posts, vues médianes ${cnum(r.medPlays)}, engagement médian ${pct(r.medER)}`
+  ).join("\n");
+  const text = `Voici la performance par format de contenu pour ${handle === "all" ? "l'ensemble des concurrents analysés" : "@" + handle} (données publiques TikTok/Instagram) :
+
+${table}
+
+Réponds UNIQUEMENT avec un objet JSON valide :
+{
+ "constats": tableau de 3-5 constats factuels sur ce qui fonctionne ou non (appuyés sur les chiffres),
+ "recommandations": tableau de 3-4 recommandations actionnables pour une marque qui voudrait rivaliser
+}`;
+  const reply = await askClaude([{ type: "text", text }], 1000);
+  return parseJsonReply(reply);
+}
+
+/* ---------- persistance ---------- */
+const STORE_KEY = "sd_workspace_v1";
+function stripForStorage(competitors) {
+  const out = {};
+  for (const [k, c] of Object.entries(competitors)) {
+    out[k] = { ...c, posts: c.posts.map((p) => ({ ...p, frames: [] })) };
+  }
+  return out;
+}
+
+/* ============================================================ */
+function SocialDecoder() {
+  const [competitors, setCompetitors] = useState({});
+  const [analyses, setAnalyses] = useState({ brand: {}, patterns: {} });
+  const [view, setView] = useState("import");
+  const [busy, setBusy] = useState(null); // {label, done, total}
+  const [toast, setToast] = useState(null);
+  const [pasteVal, setPasteVal] = useState("");
+  const [dashComp, setDashComp] = useState("all");
+  const [sortKey, setSortKey] = useState("plays");
+  const [loaded, setLoaded] = useState(false);
+  const stopRef = useRef(false);
+  const fileRef = useRef(null);
+  const wsFileRef = useRef(null);
+  const uploadTargets = useRef({});
+  const [drive, setDrive] = useState({ url: "", key: "" });
+  const [driveList, setDriveList] = useState(null);
+
+  const notify = (msg, kind = "ok") => { setToast({ msg, kind }); setTimeout(() => setToast(null), 4200); };
+
+  /* --- chargement / sauvegarde espace --- */
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await appStorage.get(STORE_KEY);
+        if (r?.value) {
+          const ws = JSON.parse(r.value);
+          setCompetitors(ws.competitors || {});
+          setAnalyses(ws.analyses || { brand: {}, patterns: {} });
+          if (ws.drive?.url) setDrive(ws.drive);
+        }
+      } catch (e) { /* pas d'espace sauvegardé */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  const saveWorkspace = async (comps = competitors, ana = analyses, silent = false) => {
+    try {
+      await appStorage.set(STORE_KEY, JSON.stringify({ competitors: stripForStorage(comps), analyses: ana, drive }));
+      if (!silent) notify("Espace de travail sauvegardé (les frames vidéo ne sont pas conservées, les tags et transcriptions le sont).");
+    } catch (e) { if (!silent) notify("Sauvegarde impossible : " + e.message, "err"); }
+  };
+
+  /* --- pipeline Drive (API Apps Script v3.2) --- */
+  const driveCall = async (params) => {
+    const qs = new URLSearchParams({ ...params, key: drive.key }).toString();
+    const res = await fetch(drive.url + (drive.url.includes("?") ? "&" : "?") + qs);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  };
+
+  const loadDriveList = async () => {
+    setBusy({ label: "Lecture du pipeline Drive", done: 0, total: 1 });
+    try {
+      const list = await driveCall({ action: "list" });
+      if (list.error) throw new Error(list.error);
+      setDriveList(list);
+      saveWorkspace(competitors, analyses, true);
+      notify(`${list.length} dataset(s) trouvé(s) dans le pipeline.`);
+    } catch (e) {
+      notify("Connexion impossible : " + e.message + ". Vérifie l'URL /exec, la clé, et que le déploiement est bien en accès « Tout le monde ».", "err");
+    }
+    setBusy(null);
+  };
+
+  const importFromDrive = async (ds) => {
+    setBusy({ label: `Import de ${ds.name}`, done: 0, total: 1 });
+    try {
+      const data = await driveCall({ action: "dataset", id: ds.id });
+      if (data.error) throw new Error(data.error);
+      ingestJson(JSON.stringify(data), ds.name);
+    } catch (e) { notify("Import impossible : " + e.message, "err"); }
+    setBusy(null);
+  };
+
+  const fetchDriveVideoUrl = async (post) => {
+    const r = await driveCall({ action: "media", path: post.folder + "/" + post.files.video });
+    if (r.error) throw new Error(r.error);
+    const bin = atob(r.data);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return URL.createObjectURL(new Blob([arr], { type: r.mime || "video/mp4" }));
+  };
+
+  const retryViaDrive = async (p) => {
+    setBusy({ label: "Récupération du MP4 via Drive", done: 0, total: 1 });
+    try {
+      const blobUrl = await fetchDriveVideoUrl(p);
+      const frames = await extractFrames(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+      patchPost(p.compKey, p.id, { frames, frameError: null });
+      notify("Frames extraites depuis le MP4 stocké dans Drive.");
+    } catch (e) { notify("Échec via Drive : " + e.message, "err"); }
+    setBusy(null);
+  };
+
+  /* --- import --- */
+  const ingestJson = (raw, sourceName) => {
+    let data;
+    try { data = JSON.parse(raw); } catch (e) { notify(`${sourceName} : JSON invalide.`, "err"); return; }
+    const items = Array.isArray(data) ? data : [data];
+    const normalized = items.map(normalizeItem).filter(Boolean);
+    if (!normalized.length) { notify(`${sourceName} : aucun post TikTok/Instagram reconnu.`, "err"); return; }
+    setCompetitors((prev) => {
+      const next = { ...prev };
+      let added = 0;
+      for (const p of normalized) {
+        const key = `${p.platform}:${p.account}`;
+        if (!next[key]) {
+          next[key] = {
+            handle: p.account, nickName: p.nickName, platform: p.platform,
+            fans: p.authorMeta?.fans, heart: p.authorMeta?.heart,
+            signature: p.authorMeta?.signature, color: RAMP[Object.keys(next).length % RAMP.length],
+            posts: [],
+          };
+        }
+        if (!next[key].posts.some((x) => x.id === p.id)) { next[key].posts.push(p); added++; }
+      }
+      notify(`${sourceName} : ${added} posts importés (${normalized.length - added} doublons ignorés).`);
+      saveWorkspace(next, analyses, true);
+      return next;
+    });
+  };
+
+  const onFiles = (files) => {
+    for (const f of files) {
+      const reader = new FileReader();
+      reader.onload = () => ingestJson(reader.result, f.name);
+      reader.readAsText(f);
+    }
+  };
+
+  const removeCompetitor = (key) => {
+    setCompetitors((prev) => {
+      const next = { ...prev }; delete next[key];
+      saveWorkspace(next, analyses, true);
+      return next;
+    });
+  };
+
+  /* --- mutation d'un post --- */
+  const patchPost = useCallback((compKey, postId, patch) => {
+    setCompetitors((prev) => {
+      const c = prev[compKey]; if (!c) return prev;
+      return { ...prev, [compKey]: { ...c, posts: c.posts.map((p) => (p.id === postId ? { ...p, ...patch } : p)) } };
+    });
+  }, []);
+
+  /* --- pipeline stats --- */
+  const allPosts = useMemo(() => Object.entries(competitors).flatMap(([k, c]) => c.posts.map((p) => ({ ...p, compKey: k, color: c.color }))), [competitors]);
+  const stats = useMemo(() => ({
+    posts: allPosts.length,
+    transcripts: allPosts.filter((p) => p.transcript).length,
+    transcriptable: allPosts.filter((p) => p.subtitleUrl).length,
+    framed: allPosts.filter((p) => p.frames?.length || p.imageUrls?.length).length,
+    videos: allPosts.filter((p) => p.videoUrl).length,
+    tagged: allPosts.filter((p) => p.tags).length,
+    brands: Object.keys(analyses.brand).length,
+  }), [allPosts, analyses]);
+
+  /* --- enrichissement : transcriptions --- */
+  const runTranscripts = async () => {
+    const todo = allPosts.filter((p) => p.subtitleUrl && !p.transcript);
+    if (!todo.length) { notify("Toutes les transcriptions disponibles sont déjà récupérées."); return; }
+    stopRef.current = false;
+    setBusy({ label: "Récupération des transcriptions", done: 0, total: todo.length });
+    let ok = 0, ko = 0;
+    for (let i = 0; i < todo.length; i++) {
+      if (stopRef.current) break;
+      const p = todo[i];
+      try {
+        const res = await fetch(p.subtitleUrl);
+        if (!res.ok) throw new Error(res.status);
+        const txt = await res.text();
+        patchPost(p.compKey, p.id, { transcript: parseVtt(txt) || "(transcription vide)" });
+        ok++;
+      } catch (e) { ko++; }
+      setBusy({ label: "Récupération des transcriptions", done: i + 1, total: todo.length });
+    }
+    setBusy(null);
+    notify(`Transcriptions : ${ok} récupérées${ko ? `, ${ko} en échec` : ""}.`);
+    setCompetitors((prev) => { saveWorkspace(prev, analyses, true); return prev; });
+  };
+
+  /* --- enrichissement : frames --- */
+  const runFrames = async (limit = Infinity) => {
+    const todo = allPosts.filter((p) => (p.videoUrl || (drive.url && p.files?.video && p.folder)) && !p.frames?.length && !p.frameError).slice(0, limit);
+    if (!todo.length) { notify("Aucune vidéo en attente d'extraction (vérifie les échecs plus bas)."); return; }
+    stopRef.current = false;
+    setBusy({ label: "Extraction des frames vidéo", done: 0, total: todo.length });
+    let ok = 0, ko = 0;
+    for (let i = 0; i < todo.length; i++) {
+      if (stopRef.current) break;
+      const p = todo[i];
+      try {
+        let frames;
+        try {
+          if (!p.videoUrl) throw new Error("pas d'URL directe");
+          frames = await extractFrames(p.videoUrl);
+        } catch (e1) {
+          if (drive.url && p.files?.video && p.folder) {
+            const blobUrl = await fetchDriveVideoUrl(p);
+            frames = await extractFrames(blobUrl);
+            URL.revokeObjectURL(blobUrl);
+          } else { throw e1; }
+        }
+        patchPost(p.compKey, p.id, { frames, frameError: null });
+        ok++;
+      } catch (e) {
+        patchPost(p.compKey, p.id, { frameError: e.message || "échec" });
+        ko++;
+      }
+      setBusy({ label: "Extraction des frames vidéo", done: i + 1, total: todo.length });
+    }
+    setBusy(null);
+    notify(`Frames : ${ok} vidéos traitées${ko ? `, ${ko} en échec (upload manuel possible)` : ""}.`);
+  };
+
+  const onManualVideo = async (compKey, postId, file) => {
+    setBusy({ label: "Extraction depuis le fichier", done: 0, total: 1 });
+    try {
+      const frames = await extractFramesFromFile(file);
+      patchPost(compKey, postId, { frames, frameError: null });
+      notify("Frames extraites depuis le fichier local.");
+    } catch (e) { notify("Extraction impossible : " + e.message, "err"); }
+    setBusy(null);
+  };
+
+  /* --- IA : tagging --- */
+  const runTagging = async (limit = 10) => {
+    const todo = allPosts.filter((p) => !p.tags && (p.frames?.length || p.imageUrls?.length || p.transcript || p.caption)).slice(0, limit);
+    if (!todo.length) { notify("Aucun post en attente de tagging."); return; }
+    stopRef.current = false;
+    setBusy({ label: "Tagging IA des contenus", done: 0, total: todo.length });
+    let ok = 0, ko = 0;
+    for (let i = 0; i < todo.length; i++) {
+      if (stopRef.current) break;
+      const p = todo[i];
+      try {
+        const tags = await tagPost(p);
+        patchPost(p.compKey, p.id, { tags });
+        ok++;
+      } catch (e) { ko++; }
+      setBusy({ label: "Tagging IA des contenus", done: i + 1, total: todo.length });
+    }
+    setBusy(null);
+    notify(`Tagging : ${ok} posts analysés${ko ? `, ${ko} en échec` : ""}.`);
+    setCompetitors((prev) => { saveWorkspace(prev, analyses, true); return prev; });
+  };
+
+  /* --- IA : marque --- */
+  const runBrand = async (compKey) => {
+    const c = competitors[compKey];
+    setBusy({ label: `Analyse de marque @${c.handle}`, done: 0, total: 1 });
+    try {
+      const result = await analyzeBrand(c, c.posts);
+      setAnalyses((prev) => {
+        const next = { ...prev, brand: { ...prev.brand, [compKey]: result } };
+        saveWorkspace(competitors, next, true);
+        return next;
+      });
+      notify(`Personnalité de marque @${c.handle} analysée.`);
+    } catch (e) { notify("Analyse impossible : " + e.message, "err"); }
+    setBusy(null);
+  };
+
+  /* --- IA : patterns --- */
+  const formatRows = useMemo(() => {
+    const pool = allPosts.filter((p) => p.tags && (dashComp === "all" || p.compKey === dashComp));
+    const byFmt = {};
+    for (const p of pool) {
+      const f = p.tags.format || "autre";
+      (byFmt[f] = byFmt[f] || []).push(p);
+    }
+    return Object.entries(byFmt).map(([format, posts]) => ({
+      format, count: posts.length,
+      medPlays: median(posts.map((p) => p.plays)),
+      medER: median(posts.map(postER)),
+    })).sort((a, b) => (b.medER || 0) - (a.medER || 0));
+  }, [allPosts, dashComp]);
+
+  const runPatterns = async () => {
+    if (formatRows.length < 2) { notify("Tague d'abord davantage de posts pour dégager des patterns.", "err"); return; }
+    setBusy({ label: "Analyse des patterns", done: 0, total: 1 });
+    try {
+      const handle = dashComp === "all" ? "all" : competitors[dashComp]?.handle;
+      const result = await analyzePatterns(formatRows, handle);
+      setAnalyses((prev) => {
+        const next = { ...prev, patterns: { ...prev.patterns, [dashComp]: result } };
+        saveWorkspace(competitors, next, true);
+        return next;
+      });
+    } catch (e) { notify("Analyse impossible : " + e.message, "err"); }
+    setBusy(null);
+  };
+
+  /* --- export / import espace --- */
+  const exportWorkspace = () => {
+    const blob = new Blob([JSON.stringify({ competitors: stripForStorage(competitors), analyses }, null, 1)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "social-decoder-espace.json";
+    a.click();
+  };
+  const importWorkspace = (file) => {
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const ws = JSON.parse(r.result);
+        setCompetitors(ws.competitors || {});
+        setAnalyses(ws.analyses || { brand: {}, patterns: {} });
+        saveWorkspace(ws.competitors || {}, ws.analyses || { brand: {}, patterns: {} }, true);
+        notify("Espace de travail restauré.");
+      } catch (e) { notify("Fichier d'espace invalide.", "err"); }
+    };
+    r.readAsText(file);
+  };
+  const resetWorkspace = async () => {
+    setCompetitors({}); setAnalyses({ brand: {}, patterns: {} });
+    try { await appStorage.delete(STORE_KEY); } catch (e) {}
+    notify("Espace réinitialisé.");
+  };
+
+  /* --- données dashboard --- */
+  const compList = Object.entries(competitors);
+  const kpis = useMemo(() => compList.map(([key, c]) => {
+    const dates = c.posts.map((p) => new Date(p.date)).filter((d) => !isNaN(d));
+    const span = dates.length > 1 ? (Math.max(...dates) - Math.min(...dates)) / 604800000 : 1;
+    return {
+      key, handle: c.handle, color: c.color, platform: c.platform,
+      fans: c.fans, posts: c.posts.length,
+      freq: c.posts.length / Math.max(span, 1),
+      medPlays: median(c.posts.map((p) => p.plays)),
+      medER: median(c.posts.map(postER)),
+      adShare: c.posts.filter((p) => p.isAd).length / Math.max(c.posts.length, 1),
+    };
+  }), [compList]);
+
+  const monthly = useMemo(() => {
+    const months = {};
+    for (const p of allPosts) {
+      const m = monthKey(p.date); if (!m) continue;
+      months[m] = months[m] || { month: m };
+      const h = competitors[p.compKey]?.handle;
+      months[m][h] = (months[m][h] || 0) + 1;
+    }
+    return Object.values(months).sort((a, b) => a.month.localeCompare(b.month));
+  }, [allPosts, competitors]);
+
+  const tablePosts = useMemo(() => {
+    const pool = allPosts.filter((p) => dashComp === "all" || p.compKey === dashComp);
+    const key = sortKey;
+    return [...pool].sort((a, b) => {
+      if (key === "er") return (postER(b) || 0) - (postER(a) || 0);
+      if (key === "date") return new Date(b.date) - new Date(a.date);
+      return (b[key] || 0) - (a[key] || 0);
+    }).slice(0, 15);
+  }, [allPosts, dashComp, sortKey]);
+
+  /* ---------- UI ---------- */
+  const NAV = [
+    { id: "import", n: "1", label: "Importer", sub: `${stats.posts} posts` },
+    { id: "enrich", n: "2", label: "Enrichir", sub: `${stats.transcripts} transcr. · ${stats.tagged} tags` },
+    { id: "dash", n: "3", label: "Comparer", sub: `${compList.length} comptes` },
+    { id: "decode", n: "4", label: "Décoder", sub: `${stats.brands} marques analysées` },
+  ];
+
+  const Progress = () => busy && (
+    <div style={S.busyBar}>
+      <div style={S.busyInner}>
+        <span className="mono" style={{ fontSize: 12 }}>{busy.label} — {busy.done}/{busy.total}</span>
+        <button style={S.stopBtn} onClick={() => { stopRef.current = true; }}>Arrêter</button>
+      </div>
+      <div style={S.track}><div style={{ ...S.fill, width: `${(busy.done / Math.max(busy.total, 1)) * 100}%` }} /></div>
+    </div>
+  );
+
+  const PlatformDot = ({ platform }) => (
+    <span className="mono" style={{
+      fontSize: 10, padding: "2px 7px", borderRadius: 3, letterSpacing: ".06em",
+      background: platform === "tiktok" ? "#111318" : "#C13584", color: "#fff",
+    }}>{platform === "tiktok" ? "TIKTOK" : "INSTA"}</span>
+  );
+
+  return (
+    <div style={S.app}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+        * { box-sizing: border-box; }
+        body { margin: 0; }
+        .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+        button { font-family: 'Archivo', sans-serif; cursor: pointer; }
+        button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid #17181C; outline-offset: 2px; }
+        button:disabled { opacity: .45; cursor: not-allowed; }
+        tr:hover td { background: #FAFAF8; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+      `}</style>
+
+      {/* ===== SIDEBAR ===== */}
+      <aside style={S.side}>
+        <div style={S.logo}>
+          <div style={S.logoMark}>SD</div>
+          <div>
+            <div style={{ fontWeight: 800, fontSize: 15, letterSpacing: "-0.02em" }}>Social Decoder</div>
+            <div className="mono" style={{ fontSize: 10, color: "#8A8D96", letterSpacing: ".08em" }}>BENCHMARK CONCURRENTIEL</div>
+          </div>
+        </div>
+
+        <nav style={{ marginTop: 28, display: "flex", flexDirection: "column" }}>
+          {NAV.map((item, idx) => {
+            const active = view === item.id;
+            return (
+              <button key={item.id} onClick={() => setView(item.id)} style={{ ...S.navItem, background: active ? "#17181C" : "transparent", color: active ? "#F4F4F2" : "#17181C" }}>
+                <span style={{ ...S.navRail, background: active ? "#F4F4F2" : "#D8D9D4" }}>
+                  <span className="mono" style={{ fontSize: 10, fontWeight: 700, color: active ? "#17181C" : "#6B6E77" }}>{item.n}</span>
+                </span>
+                <span style={{ flex: 1, textAlign: "left" }}>
+                  <span style={{ display: "block", fontWeight: 700, fontSize: 14 }}>{item.label}</span>
+                  <span className="mono" style={{ fontSize: 10, color: active ? "#B9BBC2" : "#8A8D96" }}>{item.sub}</span>
+                </span>
+                {idx < NAV.length - 1 && <span style={{ ...S.navConnector, borderColor: "#D8D9D4" }} />}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+          <div className="mono" style={{ fontSize: 10, color: "#8A8D96", letterSpacing: ".08em" }}>ESPACE DE TRAVAIL</div>
+          <button style={S.sideBtn} onClick={() => saveWorkspace()}>Sauvegarder</button>
+          <button style={S.sideBtn} onClick={exportWorkspace}>Exporter en JSON</button>
+          <button style={S.sideBtn} onClick={() => wsFileRef.current?.click()}>Restaurer un export</button>
+          <button style={S.sideBtn} onClick={() => { const k = window.prompt("Clé API Anthropic (sk-ant-...) — stockée uniquement dans ton navigateur :", ANTHROPIC_KEY); if (k !== null) { ANTHROPIC_KEY = k.trim(); localStorage.setItem("sd_anthropic_key", ANTHROPIC_KEY); } }}>Clé API Anthropic…</button>
+          <button style={{ ...S.sideBtn, color: "#A33" }} onClick={resetWorkspace}>Réinitialiser</button>
+          <input ref={wsFileRef} type="file" accept=".json" style={{ display: "none" }} onChange={(e) => e.target.files[0] && importWorkspace(e.target.files[0])} />
+        </div>
+      </aside>
+
+      {/* ===== MAIN ===== */}
+      <main style={S.main}>
+        <Progress />
+        {toast && <div style={{ ...S.toast, background: toast.kind === "err" ? "#7A1F2B" : "#17181C" }}>{toast.msg}</div>}
+
+        {/* ---------- 1. IMPORTER ---------- */}
+        {view === "import" && (
+          <section>
+            <h1 style={S.h1}>Importer les données</h1>
+            <p style={S.lead}>Dépose tes exports JSON Apify (scraper TikTok ou Instagram). Les comptes sont détectés et regroupés automatiquement, les doublons ignorés.</p>
+
+            <div style={S.twoCol}>
+              <div style={S.dropzone} onClick={() => fileRef.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => { e.preventDefault(); onFiles(e.dataTransfer.files); }}>
+                <div style={{ fontWeight: 800, fontSize: 17 }}>Glisser un export Apify ici</div>
+                <div style={{ color: "#6B6E77", fontSize: 13, marginTop: 6 }}>ou cliquer pour choisir un ou plusieurs fichiers .json</div>
+                <input ref={fileRef} type="file" accept=".json" multiple style={{ display: "none" }} onChange={(e) => onFiles(e.target.files)} />
+              </div>
+              <div style={S.card}>
+                <div style={S.cardTitle}>Coller un JSON</div>
+                <textarea value={pasteVal} onChange={(e) => setPasteVal(e.target.value)} placeholder='[{"id": "…", "authorMeta": {…}}]' style={S.textarea} />
+                <button style={S.primaryBtn} disabled={!pasteVal.trim()} onClick={() => { ingestJson(pasteVal, "Collage"); setPasteVal(""); }}>Importer le JSON collé</button>
+              </div>
+            </div>
+
+            <div style={{ ...S.card, marginTop: 16 }}>
+              <div style={S.cardTitle}>Pipeline Drive (Apps Script v3.2)</div>
+              <div style={S.cardSub}>Connecte l'outil à ton script : colle l'URL de déploiement (…/exec) et ta clé générée par genererCleWeb(). L'outil listera les datasets scrapés et les importera directement — plus d'upload manuel.</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12, alignItems: "center" }}>
+                <input value={drive.url} onChange={(e) => setDrive({ ...drive, url: e.target.value.trim() })}
+                  placeholder="https://script.google.com/macros/s/…/exec"
+                  style={{ ...S.textarea, height: "auto", flex: 2, minWidth: 260, margin: 0, padding: "9px 10px" }} />
+                <input value={drive.key} onChange={(e) => setDrive({ ...drive, key: e.target.value.trim() })}
+                  placeholder="clé API web" type="password"
+                  style={{ ...S.textarea, height: "auto", flex: 1, minWidth: 160, margin: 0, padding: "9px 10px" }} />
+                <button style={S.primaryBtn} disabled={!drive.url || !drive.key || !!busy} onClick={loadDriveList}>Lister les datasets</button>
+              </div>
+              {driveList && (
+                <div style={{ marginTop: 14 }}>
+                  <div style={S.sectionLabel}>DATASETS DISPONIBLES DANS LE PIPELINE</div>
+                  {driveList.length === 0 && <div style={{ fontSize: 13, color: "#6B6E77" }}>Aucun dataset trouvé — lance d'abord syncSocialDecoder() côté Apps Script.</div>}
+                  {driveList.map((ds) => (
+                    <div key={ds.id} style={S.failRow}>
+                      <span className="mono" style={{ flex: 1, fontSize: 12 }}>{ds.folder}/{ds.name}</span>
+                      <button style={{ ...S.ghostBtn, marginTop: 0 }} onClick={() => importFromDrive(ds)} disabled={!!busy}>Importer</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {compList.length === 0 && loaded && (
+              <div style={S.empty}>Aucun compte importé pour l'instant. Commence par déposer l'export Apify d'un concurrent — par exemple ton dataset Castorama.</div>
+            )}
+
+            {compList.length > 0 && (
+              <div style={{ marginTop: 28 }}>
+                <div style={S.sectionLabel}>COMPTES SUIVIS</div>
+                <div style={S.compGrid}>
+                  {compList.map(([key, c]) => {
+                    const medER = median(c.posts.map(postER));
+                    return (
+                      <div key={key} style={{ ...S.compCard, borderTop: `3px solid ${c.color}` }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <PlatformDot platform={c.platform} />
+                          <span style={{ fontWeight: 800, fontSize: 16 }}>@{c.handle}</span>
+                        </div>
+                        <div style={{ color: "#6B6E77", fontSize: 12, marginTop: 4 }}>{truncate(c.signature, 70) || c.nickName}</div>
+                        <div style={S.miniStats}>
+                          <div><span className="mono" style={S.big}>{cnum(c.fans)}</span><span style={S.small}>abonnés</span></div>
+                          <div><span className="mono" style={S.big}>{c.posts.length}</span><span style={S.small}>posts</span></div>
+                          <div><span className="mono" style={S.big}>{pct(medER)}</span><span style={S.small}>engag. méd.</span></div>
+                        </div>
+                        <button style={S.ghostBtn} onClick={() => removeCompetitor(key)}>Retirer ce compte</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ---------- 2. ENRICHIR ---------- */}
+        {view === "enrich" && (
+          <section>
+            <h1 style={S.h1}>Enrichir les contenus</h1>
+            <p style={S.lead}>Trois étapes : récupérer les transcriptions, extraire des images des vidéos, puis laisser l'IA taguer chaque post (format, hook, décor, esthétique).</p>
+            {stats.posts === 0 && <div style={S.empty}>Importe d'abord des posts à l'étape 1.</div>}
+
+            {stats.posts > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                {/* transcriptions */}
+                <div style={S.card}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+                    <div>
+                      <div style={S.cardTitle}>Transcriptions audio</div>
+                      <div style={S.cardSub}>Récupérées depuis les sous-titres ASR stockés par Apify (.vtt). <span className="mono">{stats.transcripts}/{stats.transcriptable}</span> disponibles récupérées.</div>
+                    </div>
+                    <button style={S.primaryBtn} disabled={!!busy} onClick={runTranscripts}>Récupérer les transcriptions</button>
+                  </div>
+                </div>
+
+                {/* frames */}
+                <div style={S.card}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+                    <div>
+                      <div style={S.cardTitle}>Images extraites des vidéos</div>
+                      <div style={S.cardSub}>4 frames par vidéo, extraites dans ton navigateur depuis les MP4 hébergés par Apify. <span className="mono">{stats.framed}/{stats.posts}</span> posts couverts (diaporamas inclus).</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button style={S.secondaryBtn} disabled={!!busy} onClick={() => runFrames(10)}>Extraire 10 vidéos</button>
+                      <button style={S.primaryBtn} disabled={!!busy} onClick={() => runFrames()}>Tout extraire</button>
+                    </div>
+                  </div>
+                  {allPosts.some((p) => p.frameError) && (
+                    <div style={{ marginTop: 14 }}>
+                      <div style={S.sectionLabel}>ÉCHECS D'EXTRACTION — UPLOAD MANUEL DU MP4</div>
+                      {allPosts.filter((p) => p.frameError).slice(0, 8).map((p) => (
+                        <div key={p.id} style={S.failRow}>
+                          <span style={{ flex: 1, fontSize: 13 }}>{truncate(p.caption, 60) || p.id} <span className="mono" style={{ color: "#A33", fontSize: 11 }}>({p.frameError})</span></span>
+                          {drive.url && p.files?.video && p.folder && (
+                            <button style={S.ghostBtn} onClick={() => retryViaDrive(p)}>Récupérer via Drive</button>
+                          )}
+                          <button style={S.ghostBtn} onClick={() => uploadTargets.current[p.id]?.click()}>Charger le MP4</button>
+                          <input type="file" accept="video/mp4" style={{ display: "none" }}
+                            ref={(el) => (uploadTargets.current[p.id] = el)}
+                            onChange={(e) => e.target.files[0] && onManualVideo(p.compKey, p.id, e.target.files[0])} />
+                        </div>
+                      ))}
+                      <div style={{ fontSize: 12, color: "#6B6E77", marginTop: 6 }}>Si l'extraction directe échoue (restriction du serveur vidéo), récupère le MP4 depuis ton dossier Google Drive et charge-le ici.</div>
+                    </div>
+                  )}
+                </div>
+
+                {/* tagging */}
+                <div style={S.card}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+                    <div>
+                      <div style={S.cardTitle}>Tagging IA</div>
+                      <div style={S.cardSub}>Claude analyse frames + caption + transcription : format, type de hook, décor, présence humaine, texte à l'écran, esthétique, sujets. <span className="mono">{stats.tagged}/{stats.posts}</span> posts tagués.</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button style={S.secondaryBtn} disabled={!!busy} onClick={() => runTagging(10)}>Taguer 10 posts</button>
+                      <button style={S.primaryBtn} disabled={!!busy} onClick={() => runTagging(Infinity)}>Tout taguer</button>
+                    </div>
+                  </div>
+                  {stats.tagged > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 14 }}>
+                      {Object.entries(allPosts.filter((p) => p.tags).reduce((acc, p) => { const f = p.tags.format; acc[f] = (acc[f] || 0) + 1; return acc; }, {}))
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([f, n]) => <span key={f} style={S.chip}>{FMT_LABELS[f] || f} <b className="mono">{n}</b></span>)}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ---------- 3. COMPARER ---------- */}
+        {view === "dash" && (
+          <section>
+            <h1 style={S.h1}>Comparer les comptes</h1>
+            {stats.posts === 0 ? <div style={S.empty}>Importe d'abord des posts à l'étape 1.</div> : (
+              <>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 20 }}>
+                  <button style={{ ...S.filterChip, ...(dashComp === "all" ? S.filterChipOn : {}) }} onClick={() => setDashComp("all")}>Tous les comptes</button>
+                  {compList.map(([key, c]) => (
+                    <button key={key} style={{ ...S.filterChip, ...(dashComp === key ? S.filterChipOn : {}), borderLeft: `3px solid ${c.color}` }} onClick={() => setDashComp(key)}>@{c.handle}</button>
+                  ))}
+                </div>
+
+                {/* KPI cards */}
+                <div style={S.kpiGrid}>
+                  {kpis.filter((k) => dashComp === "all" || k.key === dashComp).map((k) => (
+                    <div key={k.key} style={{ ...S.kpiCard, borderTop: `3px solid ${k.color}` }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontWeight: 800 }}>@{k.handle}</span>
+                        <PlatformDot platform={k.platform} />
+                      </div>
+                      <div style={S.kpiRow}><span style={S.small}>Abonnés</span><span className="mono" style={S.big}>{cnum(k.fans)}</span></div>
+                      <div style={S.kpiRow}><span style={S.small}>Fréquence</span><span className="mono" style={S.big}>{k.freq.toFixed(1)}/sem</span></div>
+                      <div style={S.kpiRow}><span style={S.small}>Vues médianes</span><span className="mono" style={S.big}>{cnum(k.medPlays)}</span></div>
+                      <div style={S.kpiRow}><span style={S.small}>Engagement médian</span><span className="mono" style={S.big}>{pct(k.medER)}</span></div>
+                      <div style={S.kpiRow}><span style={S.small}>Part sponsorisée</span><span className="mono" style={S.big}>{(k.adShare * 100).toFixed(0)} %</span></div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* charts */}
+                {compList.length > 0 && (
+                  <div style={S.twoCol}>
+                    <div style={S.card}>
+                      <div style={S.cardTitle}>Engagement médian par compte</div>
+                      <ResponsiveContainer width="100%" height={230}>
+                        <BarChart data={kpis} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                          <CartesianGrid strokeDasharray="2 4" stroke="#E3E4E0" vertical={false} />
+                          <XAxis dataKey="handle" tick={{ fontSize: 12, fontFamily: "Archivo" }} />
+                          <YAxis tickFormatter={(v) => (v * 100).toFixed(1) + "%"} tick={{ fontSize: 11, fontFamily: "JetBrains Mono" }} width={52} />
+                          <Tooltip formatter={(v) => pct(v)} />
+                          <Bar dataKey="medER" name="Engagement médian" radius={[3, 3, 0, 0]}>
+                            {kpis.map((k) => <Cell key={k.key} fill={k.color} />)}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div style={S.card}>
+                      <div style={S.cardTitle}>Rythme de publication par mois</div>
+                      <ResponsiveContainer width="100%" height={230}>
+                        <LineChart data={monthly} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                          <CartesianGrid strokeDasharray="2 4" stroke="#E3E4E0" vertical={false} />
+                          <XAxis dataKey="month" tick={{ fontSize: 11, fontFamily: "JetBrains Mono" }} />
+                          <YAxis allowDecimals={false} tick={{ fontSize: 11, fontFamily: "JetBrains Mono" }} width={30} />
+                          <Tooltip />
+                          <Legend />
+                          {compList.map(([key, c]) => (
+                            <Line key={key} type="monotone" dataKey={c.handle} stroke={c.color} strokeWidth={2} dot={false} />
+                          ))}
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                )}
+
+                {/* top posts */}
+                <div style={{ ...S.card, marginTop: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+                    <div style={S.cardTitle}>Top posts</div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {[["plays", "Vues"], ["er", "Engagement"], ["date", "Récents"]].map(([k, l]) => (
+                        <button key={k} style={{ ...S.filterChip, ...(sortKey === k ? S.filterChipOn : {}) }} onClick={() => setSortKey(k)}>{l}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ overflowX: "auto", marginTop: 10 }}>
+                    <table style={S.table}>
+                      <thead>
+                        <tr>
+                          {["", "Post", "Date", "Vues", "Likes", "Comm.", "Engag.", "Format"].map((h) => <th key={h} style={S.th}>{h}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {tablePosts.map((p) => (
+                          <tr key={p.id}>
+                            <td style={{ ...S.td, borderLeft: `3px solid ${p.color}`, width: 46 }}>
+                              {p.coverUrl ? <img src={p.coverUrl} alt="" style={S.thumb} onError={(e) => (e.target.style.display = "none")} /> : null}
+                            </td>
+                            <td style={{ ...S.td, maxWidth: 300 }}>
+                              <a href={p.webUrl} target="_blank" rel="noreferrer" style={{ color: "#17181C", textDecoration: "none", fontWeight: 600 }}>{truncate(p.caption, 80) || "(sans caption)"}</a>
+                              {p.isAd && <span style={{ ...S.chip, marginLeft: 6, background: "#F3E4C8" }}>Sponso</span>}
+                              {p.transcript && <div style={{ fontSize: 11, color: "#8A8D96", marginTop: 3 }}>{truncate(p.transcript, 90)}</div>}
+                            </td>
+                            <td style={S.td} className="mono">{(p.date || "").slice(0, 10)}</td>
+                            <td style={S.td} className="mono">{cnum(p.plays)}</td>
+                            <td style={S.td} className="mono">{cnum(p.likes)}</td>
+                            <td style={S.td} className="mono">{cnum(p.comments)}</td>
+                            <td style={S.td} className="mono">{pct(postER(p))}</td>
+                            <td style={S.td}>{p.tags ? <span style={S.chip}>{FMT_LABELS[p.tags.format] || p.tags.format}</span> : <span style={{ color: "#B9BBC2" }}>—</span>}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            )}
+          </section>
+        )}
+
+        {/* ---------- 4. DÉCODER ---------- */}
+        {view === "decode" && (
+          <section>
+            <h1 style={S.h1}>Décoder les marques</h1>
+            <p style={S.lead}>Analyse qualitative : personnalité et tonalité de chaque marque, puis patterns format × performance pour comprendre ce qui fonctionne.</p>
+            {stats.posts === 0 && <div style={S.empty}>Importe d'abord des posts à l'étape 1.</div>}
+
+            {/* marques */}
+            {compList.map(([key, c]) => {
+              const b = analyses.brand[key];
+              return (
+                <div key={key} style={{ ...S.card, marginBottom: 16, borderTop: `3px solid ${c.color}` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ fontWeight: 800, fontSize: 17 }}>@{c.handle}</span>
+                      <PlatformDot platform={c.platform} />
+                    </div>
+                    <button style={S.primaryBtn} disabled={!!busy} onClick={() => runBrand(key)}>{b ? "Réanalyser" : "Analyser la personnalité de marque"}</button>
+                  </div>
+                  {!b && <div style={{ ...S.cardSub, marginTop: 8 }}>L'analyse s'appuie sur les captions et transcriptions des {Math.min(c.posts.length, 28)} posts les plus vus. Récupère les transcriptions à l'étape 2 pour un portrait plus fin.</div>}
+                  {b && (
+                    <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
+                      <div>
+                        <div style={S.sectionLabel}>PERSONNALITÉ</div>
+                        <p style={S.bodyText}>{b.personnalite}</p>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                          {(b.tonalites || []).map((t) => <span key={t} style={{ ...S.chip, background: c.color + "22", color: "#17181C" }}>{t}</span>)}
+                        </div>
+                        <p style={{ ...S.bodyText, marginTop: 10, fontSize: 13, color: "#6B6E77" }}>{b.registre}</p>
+                      </div>
+                      <div>
+                        <div style={S.sectionLabel}>PILIERS ÉDITORIAUX</div>
+                        <ul style={S.ul}>{(b.piliersEditoriaux || []).map((x) => <li key={x}>{x}</li>)}</ul>
+                      </div>
+                      <div>
+                        <div style={S.sectionLabel}>FORCES / FAIBLESSES</div>
+                        <ul style={S.ul}>{(b.forces || []).map((x) => <li key={x} style={{ color: "#1E8A5A" }}>{x}</li>)}</ul>
+                        <ul style={S.ul}>{(b.faiblesses || []).map((x) => <li key={x} style={{ color: "#A33" }}>{x}</li>)}</ul>
+                      </div>
+                      <div style={{ gridColumn: "1 / -1", background: "#F4F4F2", padding: "12px 14px", borderRadius: 6 }}>
+                        <div style={S.sectionLabel}>SYNTHÈSE STRATÉGIQUE</div>
+                        <p style={S.bodyText}>{b.resume}</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* patterns */}
+            {stats.tagged > 0 && (
+              <div style={S.card}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+                  <div>
+                    <div style={S.cardTitle}>Patterns format × performance</div>
+                    <div style={S.cardSub}>Basé sur les {stats.tagged} posts tagués {dashComp === "all" ? "(tous comptes)" : `(@${competitors[dashComp]?.handle})`} — change le filtre dans l'onglet Comparer.</div>
+                  </div>
+                  <button style={S.primaryBtn} disabled={!!busy} onClick={runPatterns}>Générer les insights IA</button>
+                </div>
+                <div style={{ overflowX: "auto", marginTop: 12 }}>
+                  <table style={S.table}>
+                    <thead><tr>{["Format", "Posts", "Vues médianes", "Engagement médian"].map((h) => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                    <tbody>
+                      {formatRows.map((r) => (
+                        <tr key={r.format}>
+                          <td style={{ ...S.td, fontWeight: 700 }}>{FMT_LABELS[r.format] || r.format}</td>
+                          <td style={S.td} className="mono">{r.count}</td>
+                          <td style={S.td} className="mono">{cnum(r.medPlays)}</td>
+                          <td style={S.td} className="mono">{pct(r.medER)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {analyses.patterns[dashComp] && (
+                  <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14 }}>
+                    <div>
+                      <div style={S.sectionLabel}>CE QUE DISENT LES CHIFFRES</div>
+                      <ul style={S.ul}>{(analyses.patterns[dashComp].constats || []).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                    </div>
+                    <div>
+                      <div style={S.sectionLabel}>RECOMMANDATIONS</div>
+                      <ul style={S.ul}>{(analyses.patterns[dashComp].recommandations || []).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+            {stats.posts > 0 && stats.tagged === 0 && (
+              <div style={S.empty}>Les patterns apparaîtront ici une fois les posts tagués à l'étape 2.</div>
+            )}
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}
+
+/* ---------- styles ---------- */
+const S = {
+  app: { display: "flex", minHeight: "100vh", background: "#F4F4F2", color: "#17181C", fontFamily: "'Archivo', sans-serif" },
+  side: { width: 240, flexShrink: 0, background: "#EDEDEA", borderRight: "1px solid #E0E1DC", padding: "22px 16px", display: "flex", flexDirection: "column", position: "sticky", top: 0, height: "100vh" },
+  logo: { display: "flex", alignItems: "center", gap: 10 },
+  logoMark: { width: 36, height: 36, borderRadius: 8, background: "#17181C", color: "#F4F4F2", display: "grid", placeItems: "center", fontWeight: 800, fontSize: 14, letterSpacing: "-0.03em" },
+  navItem: { display: "flex", alignItems: "center", gap: 10, padding: "10px 10px", borderRadius: 8, border: "none", marginBottom: 4, position: "relative", transition: "background .15s" },
+  navRail: { width: 22, height: 22, borderRadius: 6, display: "grid", placeItems: "center", flexShrink: 0 },
+  navConnector: {},
+  sideBtn: { textAlign: "left", background: "transparent", border: "1px solid #D8D9D4", borderRadius: 6, padding: "7px 10px", fontSize: 12.5, fontWeight: 600, color: "#17181C" },
+  main: { flex: 1, padding: "34px 40px 60px", maxWidth: 1160, position: "relative" },
+  h1: { fontSize: 30, fontWeight: 800, letterSpacing: "-0.03em", margin: "0 0 8px" },
+  lead: { color: "#5C5F6A", fontSize: 14.5, margin: "0 0 24px", maxWidth: 680, lineHeight: 1.5 },
+  twoCol: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 },
+  dropzone: { border: "2px dashed #C6C8C1", borderRadius: 10, padding: "42px 24px", textAlign: "center", cursor: "pointer", background: "#FFFFFF" },
+  card: { background: "#FFFFFF", border: "1px solid #E3E4E0", borderRadius: 10, padding: "18px 20px" },
+  cardTitle: { fontWeight: 800, fontSize: 15.5, letterSpacing: "-0.01em" },
+  cardSub: { color: "#6B6E77", fontSize: 13, marginTop: 3, lineHeight: 1.45, maxWidth: 560 },
+  textarea: { width: "100%", height: 96, marginTop: 10, marginBottom: 10, border: "1px solid #E3E4E0", borderRadius: 6, padding: 10, fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, resize: "vertical" },
+  primaryBtn: { background: "#17181C", color: "#F4F4F2", border: "none", borderRadius: 6, padding: "9px 16px", fontWeight: 700, fontSize: 13.5 },
+  secondaryBtn: { background: "#FFFFFF", color: "#17181C", border: "1.5px solid #17181C", borderRadius: 6, padding: "8px 14px", fontWeight: 700, fontSize: 13.5 },
+  ghostBtn: { background: "transparent", color: "#6B6E77", border: "1px solid #E3E4E0", borderRadius: 6, padding: "6px 10px", fontSize: 12, fontWeight: 600, marginTop: 10 },
+  empty: { marginTop: 22, padding: "26px 24px", background: "#FFFFFF", border: "1px dashed #C6C8C1", borderRadius: 10, color: "#6B6E77", fontSize: 14 },
+  sectionLabel: { fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, letterSpacing: ".1em", color: "#8A8D96", marginBottom: 8 },
+  compGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))", gap: 14 },
+  compCard: { background: "#FFFFFF", border: "1px solid #E3E4E0", borderRadius: 10, padding: "16px 18px" },
+  miniStats: { display: "flex", gap: 18, marginTop: 14 },
+  big: { display: "block", fontSize: 16, fontWeight: 700 },
+  small: { display: "block", fontSize: 10.5, color: "#8A8D96", marginTop: 2 },
+  kpiGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))", gap: 14, marginBottom: 18 },
+  kpiCard: { background: "#FFFFFF", border: "1px solid #E3E4E0", borderRadius: 10, padding: "14px 16px" },
+  kpiRow: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginTop: 9 },
+  filterChip: { background: "#FFFFFF", border: "1px solid #E3E4E0", borderRadius: 20, padding: "6px 14px", fontSize: 13, fontWeight: 600, color: "#17181C" },
+  filterChipOn: { background: "#17181C", color: "#F4F4F2", borderColor: "#17181C" },
+  chip: { display: "inline-block", background: "#EDEDEA", borderRadius: 4, padding: "3px 8px", fontSize: 11.5, fontWeight: 600 },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
+  th: { textAlign: "left", padding: "8px 10px", fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, letterSpacing: ".08em", color: "#8A8D96", borderBottom: "1px solid #E3E4E0", textTransform: "uppercase" },
+  td: { padding: "9px 10px", borderBottom: "1px solid #F0F0EC", verticalAlign: "top" },
+  thumb: { width: 34, height: 60, objectFit: "cover", borderRadius: 4, display: "block" },
+  failRow: { display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: "1px solid #F0F0EC" },
+  ul: { margin: "4px 0 0", paddingLeft: 18, fontSize: 13.5, lineHeight: 1.6 },
+  bodyText: { margin: 0, fontSize: 14, lineHeight: 1.55 },
+  busyBar: { position: "sticky", top: 0, zIndex: 20, background: "#FFFFFF", border: "1px solid #E3E4E0", borderRadius: 8, padding: "10px 14px", marginBottom: 18, boxShadow: "0 2px 10px rgba(23,24,28,.06)" },
+  busyInner: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 },
+  stopBtn: { background: "transparent", border: "1px solid #E3E4E0", borderRadius: 5, padding: "3px 10px", fontSize: 11.5, fontWeight: 600 },
+  track: { height: 5, background: "#EDEDEA", borderRadius: 3, overflow: "hidden" },
+  fill: { height: "100%", background: "#17181C", transition: "width .3s" },
+  toast: { position: "fixed", bottom: 22, right: 22, zIndex: 50, color: "#F4F4F2", padding: "11px 16px", borderRadius: 8, fontSize: 13.5, maxWidth: 380, boxShadow: "0 6px 20px rgba(0,0,0,.18)" },
+};
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<SocialDecoder />);
+</script>
+</body>
+</html>
