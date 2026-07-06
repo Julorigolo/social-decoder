@@ -64,6 +64,13 @@ function parseVtt(txt) {
   return out.join(" ");
 }
 
+/* ---------- token Apify (stockage privé) ---------- */
+let APIFY_TOKEN = "";
+const withApifyToken = (url) =>
+  url && url.indexOf("https://api.apify.com/") === 0 && APIFY_TOKEN
+    ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(APIFY_TOKEN)
+    : url;
+
 /* ---------- normalisation Apify ---------- */
 function detectPlatform(item) {
   if (item.authorMeta || item.webVideoUrl) return "tiktok";
@@ -217,7 +224,7 @@ async function tagPost(post) {
     content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: f.split(",")[1] } });
   }
   if (!frames.length && post.imageUrls?.length) {
-    for (const u of post.imageUrls.slice(0, MAX_FRAMES_API)) content.push({ type: "image", source: { type: "url", url: u } });
+    for (const u of post.imageUrls.slice(0, MAX_FRAMES_API)) content.push({ type: "image", source: { type: "url", url: withApifyToken(u) } });
   }
   content.push({
     type: "text",
@@ -309,6 +316,8 @@ function SocialDecoder() {
   const uploadTargets = useRef({});
   const [drive, setDrive] = useState({ url: "", key: "" });
   const [driveList, setDriveList] = useState(null);
+  const [apifyToken, setApifyToken] = useState("");
+  useEffect(() => { APIFY_TOKEN = apifyToken; }, [apifyToken]);
 
   const notify = (msg, kind = "ok") => { setToast({ msg, kind }); setTimeout(() => setToast(null), 4200); };
 
@@ -322,6 +331,7 @@ function SocialDecoder() {
           setCompetitors(ws.competitors || {});
           setAnalyses(ws.analyses || { brand: {}, patterns: {} });
           if (ws.drive?.url) setDrive(ws.drive);
+          if (ws.apify) setApifyToken(ws.apify);
         }
       } catch (e) { /* pas d'espace sauvegardé */ }
       setLoaded(true);
@@ -330,7 +340,7 @@ function SocialDecoder() {
 
   const saveWorkspace = async (comps = competitors, ana = analyses, silent = false) => {
     try {
-      await appStorage.set(STORE_KEY, JSON.stringify({ competitors: stripForStorage(comps), analyses: ana, drive }));
+      await appStorage.set(STORE_KEY, JSON.stringify({ competitors: stripForStorage(comps), analyses: ana, drive, apify: apifyToken }));
       if (!silent) notify("Espace de travail sauvegardé (les frames vidéo ne sont pas conservées, les tags et transcriptions le sont).");
     } catch (e) { if (!silent) notify("Sauvegarde impossible : " + e.message, "err"); }
   };
@@ -445,7 +455,7 @@ function SocialDecoder() {
   const stats = useMemo(() => ({
     posts: allPosts.length,
     transcripts: allPosts.filter((p) => p.transcript).length,
-    transcriptable: allPosts.filter((p) => p.subtitleUrl).length,
+    transcriptable: allPosts.filter((p) => p.subtitleUrl || (p.files && (p.files.transcription || p.files.subtitle))).length,
     framed: allPosts.filter((p) => p.frames?.length || p.imageUrls?.length).length,
     videos: allPosts.filter((p) => p.videoUrl).length,
     tagged: allPosts.filter((p) => p.tags).length,
@@ -453,8 +463,34 @@ function SocialDecoder() {
   }), [allPosts, analyses]);
 
   /* --- enrichissement : transcriptions --- */
+  const fetchTranscriptDirect = async (p) => {
+    if (!p.subtitleUrl) throw new Error("pas de lien de sous-titres");
+    const res = await fetch(withApifyToken(p.subtitleUrl));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return parseVtt(await res.text());
+  };
+
+  const fetchTranscriptDrive = async (p) => {
+    const fname = p.files && (p.files.transcription || p.files.subtitle);
+    if (!(drive.url && drive.key && p.folder && fname)) throw new Error("pipeline Drive non configuré pour ce post");
+    const r = await driveCall({ action: "media", path: p.folder + "/" + fname });
+    if (r.error) throw new Error(r.error);
+    const text = new TextDecoder("utf-8").decode(Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0)));
+    return fname.endsWith(".vtt") ? parseVtt(text) : text;
+  };
+
+  const getTranscript = async (p) => {
+    // Si un token Apify est fourni : direct d'abord (plus rapide), sinon Drive d'abord.
+    const order = apifyToken ? [fetchTranscriptDirect, fetchTranscriptDrive] : [fetchTranscriptDrive, fetchTranscriptDirect];
+    let lastErr;
+    for (const fn of order) {
+      try { return await fn(p); } catch (e) { lastErr = e; }
+    }
+    throw lastErr;
+  };
+
   const runTranscripts = async () => {
-    const todo = allPosts.filter((p) => p.subtitleUrl && !p.transcript);
+    const todo = allPosts.filter((p) => (p.subtitleUrl || (p.files && (p.files.transcription || p.files.subtitle))) && !p.transcript);
     if (!todo.length) { notify("Toutes les transcriptions disponibles sont déjà récupérées."); return; }
     stopRef.current = false;
     setBusy({ label: "Récupération des transcriptions", done: 0, total: todo.length });
@@ -463,16 +499,18 @@ function SocialDecoder() {
       if (stopRef.current) break;
       const p = todo[i];
       try {
-        const res = await fetch(p.subtitleUrl);
-        if (!res.ok) throw new Error(res.status);
-        const txt = await res.text();
-        patchPost(p.compKey, p.id, { transcript: parseVtt(txt) || "(transcription vide)" });
+        const t = await getTranscript(p);
+        patchPost(p.compKey, p.id, { transcript: t || "(transcription vide)" });
         ok++;
       } catch (e) { ko++; }
       setBusy({ label: "Récupération des transcriptions", done: i + 1, total: todo.length });
     }
     setBusy(null);
-    notify(`Transcriptions : ${ok} récupérées${ko ? `, ${ko} en échec` : ""}.`);
+    if (ko > 0 && !apifyToken && !drive.url) {
+      notify(`Transcriptions : ${ok} récupérées, ${ko} en échec. Ton stockage Apify est privé : ajoute ton token Apify OU connecte le pipeline Drive (étape 1).`, "err");
+    } else {
+      notify(`Transcriptions : ${ok} récupérées${ko ? `, ${ko} en échec` : ""}.`);
+    }
     setCompetitors((prev) => { saveWorkspace(prev, analyses, true); return prev; });
   };
 
@@ -490,7 +528,7 @@ function SocialDecoder() {
         let frames;
         try {
           if (!p.videoUrl) throw new Error("pas d'URL directe");
-          frames = await extractFrames(p.videoUrl);
+          frames = await extractFrames(withApifyToken(p.videoUrl));
         } catch (e1) {
           if (drive.url && p.files?.video && p.folder) {
             const blobUrl = await fetchDriveVideoUrl(p);
@@ -756,14 +794,17 @@ function SocialDecoder() {
             </div>
 
             <div style={{ ...S.card, marginTop: 16 }}>
-              <div style={S.cardTitle}>Pipeline Drive (Apps Script v3.2)</div>
-              <div style={S.cardSub}>Connecte l'outil à ton script : colle l'URL de déploiement (…/exec) et ta clé générée par genererCleWeb(). L'outil listera les datasets scrapés et les importera directement — plus d'upload manuel.</div>
+              <div style={S.cardTitle}>Pipeline Drive & Apify</div>
+              <div style={S.cardSub}>Connecte l'outil à ton script Apps Script (URL …/exec + clé de genererCleWeb) pour importer les datasets et lire les fichiers déjà stockés dans ton Drive. Ton stockage Apify étant privé, ajoute aussi ton token Apify si tu veux que l'outil accède directement aux vidéos et sous-titres chez Apify (plus rapide) — sinon tout passera par le Drive.</div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12, alignItems: "center" }}>
                 <input value={drive.url} onChange={(e) => setDrive({ ...drive, url: e.target.value.trim() })}
                   placeholder="https://script.google.com/macros/s/…/exec"
                   style={{ ...S.textarea, height: "auto", flex: 2, minWidth: 260, margin: 0, padding: "9px 10px" }} />
                 <input value={drive.key} onChange={(e) => setDrive({ ...drive, key: e.target.value.trim() })}
                   placeholder="clé API web" type="password"
+                  style={{ ...S.textarea, height: "auto", flex: 1, minWidth: 160, margin: 0, padding: "9px 10px" }} />
+                <input value={apifyToken} onChange={(e) => setApifyToken(e.target.value.trim())}
+                  placeholder="token Apify (optionnel)" type="password"
                   style={{ ...S.textarea, height: "auto", flex: 1, minWidth: 160, margin: 0, padding: "9px 10px" }} />
                 <button style={S.primaryBtn} disabled={!drive.url || !drive.key || !!busy} onClick={loadDriveList}>Lister les datasets</button>
               </div>
@@ -827,7 +868,7 @@ function SocialDecoder() {
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
                     <div>
                       <div style={S.cardTitle}>Transcriptions audio</div>
-                      <div style={S.cardSub}>Récupérées depuis les sous-titres ASR stockés par Apify (.vtt). <span className="mono">{stats.transcripts}/{stats.transcriptable}</span> disponibles récupérées.</div>
+                      <div style={S.cardSub}>Depuis Apify (avec ton token) ou depuis les fichiers .vtt/.txt déjà stockés dans ton Drive via le pipeline. <span className="mono">{stats.transcripts}/{stats.transcriptable}</span> disponibles récupérées.</div>
                     </div>
                     <button style={S.primaryBtn} disabled={!!busy} onClick={runTranscripts}>Récupérer les transcriptions</button>
                   </div>
